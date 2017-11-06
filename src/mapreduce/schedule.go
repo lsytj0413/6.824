@@ -24,5 +24,30 @@ func (mr *Master) schedule(phase jobPhase) {
 	//
 	// TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO
 	//
+
+	for i := 0; i < ntasks; i++ {
+		fmt.Printf("wait worker")
+		worker := <-mr.registerChannel
+		fmt.Printf("wait worker done")
+
+		taskArgs := DoTaskArgs{
+			JobName:       mr.jobName,
+			File:          mr.files[i],
+			Phase:         phase,
+			TaskNumber:    i,
+			NumOtherPhase: nios}
+		var reply = new(struct{})
+		ok := call(worker, "Worker.DoTask", taskArgs, reply)
+		if ok {
+			fmt.Printf("task %v done, ok", i)
+		} else {
+			fmt.Printf("task %v done, fail", i)
+		}
+
+		go func() {
+			mr.registerChannel <- worker
+		}()
+	}
+
 	fmt.Printf("Schedule: %v phase done\n", phase)
 }
