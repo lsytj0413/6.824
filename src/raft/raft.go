@@ -23,7 +23,7 @@ import "labrpc"
 // import "bytes"
 // import "encoding/gob"
 
-//
+// ApplyMsg ...
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make().
@@ -35,7 +35,13 @@ type ApplyMsg struct {
 	Snapshot    []byte // ignore for lab2; only used in lab3
 }
 
-//
+// LogEntry ...
+type LogEntry struct {
+	Command interface{}
+	Term    int
+}
+
+// Raft ...
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
@@ -48,8 +54,26 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	// latest term server has seen
+	currentTerm int
+	// candidateId that received vote in current term, -1 for none
+	votedFor int
+	// log entries
+	log []LogEntry
+
+	// index of highest log entry known to be commited
+	commitIndex int
+	// index of highest log entry applied to state machine
+	lastApplied int
+	lastLogTerm int
+
+	// index of the next log entry to send to server, leader only
+	nextIndex []int
+	// index of the highest log entry known to be replicated to server, leader only
+	matchIndex []int
 }
 
+// GetState ...
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
@@ -97,6 +121,10 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term         int
+	CandicatedID int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -105,6 +133,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int
+	VoteGranted bool
 }
 
 //
@@ -112,6 +142,28 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	if args.Term < rf.currentTerm {
+		goto RET_FALSE
+	}
+
+	if rf.votedFor == -1 || rf.votedFor == args.CandicatedID {
+		if args.LastLogTerm < rf.lastLogTerm {
+			goto RET_FALSE
+		}
+
+		if args.LastLogIndex < rf.commitIndex {
+			goto RET_FALSE
+		}
+
+		reply.Term = args.Term
+		reply.VoteGranted = true
+		return
+	}
+
+RET_FALSE:
+	reply.Term = rf.currentTerm
+	reply.VoteGranted = false
+	return
 }
 
 //
@@ -181,7 +233,7 @@ func (rf *Raft) Kill() {
 	// Your code here, if desired.
 }
 
-//
+// Make ...
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -200,6 +252,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.currentTerm = 0
+	rf.votedFor = -1
+	rf.log = make([]LogEntry, 0)
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	rf.nextIndex = nil
+	rf.matchIndex = nil
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
