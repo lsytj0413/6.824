@@ -15,6 +15,7 @@ import (
 func doReduce(
 	jobName string, // the name of the whole MapReduce job
 	reduceTaskNumber int, // which reduce task this is
+	mergeFile string,
 	nMap int, // the number of map tasks that were run ("M" in the paper)
 	reduceF func(key string, values []string) string,
 ) {
@@ -68,7 +69,7 @@ func doReduce(
 		}
 	}
 
-	f, err := os.Create(mergeName(jobName, reduceTaskNumber))
+	f, err := os.Create(mergeFile)
 	if err != nil {
 		panic(err)
 	}
