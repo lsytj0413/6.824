@@ -105,6 +105,11 @@ type Raft struct {
 	chanGrantVote chan bool
 	// change to leader channel
 	chanLeader chan bool
+
+	// notify to run apply while commit
+	chanCommit chan bool
+	// notify state machine apply command after commit
+	chanApply chan ApplyMsg
 }
 
 // GetState ...
@@ -346,12 +351,13 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 	if ok {
 		if rf.role != LEADER {
-			// while send but leader change
+			// while send but leader change, waiting LogEntry replication
 			return ok
 		}
 
 		if args.Term != rf.currentTerm {
-			// new term
+			// while send but New Term seen, waiting LogEntry replication
+			// No Need change to FOLLOWER, happend when RequestVote
 			return ok
 		}
 
@@ -364,6 +370,14 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 		}
 
 		if reply.Success {
+			if len(args.Entries) > 0 {
+				// 日志复制成功, 更新该 server 的 nextIndex 和 matchIndex
+				rf.nextIndex[server] = args.Entries[len(args.Entries)-1].Index + 1
+				rf.matchIndex[server] = rf.nextIndex[server] - 1
+			}
+		} else {
+			// 日志冲突, 等待下一次发送时同步
+			rf.nextIndex[server] = reply.NextIndex
 		}
 	}
 
@@ -395,6 +409,56 @@ func (rf *Raft) broadcastHeartbeat() {
 	}
 }
 
+func (rf *Raft) broadcastAppendEntries() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	N := rf.commitIndex
+	last := rf.getLastLogIndex()
+	baseIndex := rf.log[0].Index
+
+	for i := rf.commitIndex + 1; i <= last; i++ {
+		num := 1
+		for j := range rf.peers {
+			// 查看当前 Follower 是否已经复制过该日志条目, 为减少日志附加传输的条目数的优化
+			// 此处检查任期是因为如果是其他任期的那么 matchIndex 的值可能不正确?
+			if j != rf.me && rf.matchIndex[j] >= i && rf.log[i-baseIndex].Term == rf.currentTerm {
+				num++
+			}
+		}
+
+		// 如果大多数 Follower都有该日志, 那么该日志即可以应用
+		if 2*num > len(rf.peers) {
+			N = i
+		}
+	}
+
+	if N != rf.commitIndex {
+		rf.commitIndex = N
+		rf.chanCommit <- true
+	}
+
+	for i := range rf.peers {
+		if i != rf.me && rf.role == LEADER {
+			if rf.nextIndex[i] > baseIndex {
+				// 当 follower 落后不多时直接传输 Log
+				args := &AppendEntriesArgs{Term: rf.currentTerm,
+					LeaderID:     rf.me,
+					PrevLogIndex: rf.nextIndex[i] - 1,
+					PrevLogTerm:  rf.log[rf.nextIndex[i]-1].Term,
+					LeaderCommit: rf.commitIndex}
+				args.Entries = make([]LogEntry, len(rf.log[args.PrevLogIndex+1-baseIndex:]))
+				copy(args.Entries, rf.log[args.PrevLogIndex+1-baseIndex:])
+				go func(i int, args *AppendEntriesArgs) {
+					var reply AppendEntriesReply
+					rf.sendAppendEntries(i, args, &reply)
+				}(i, args)
+			}
+		}
+	}
+
+}
+
 // AppendEntriesArgs ...
 type AppendEntriesArgs struct {
 	// leader's term
@@ -417,6 +481,8 @@ type AppendEntriesReply struct {
 	Term int
 	// true if follower contained entry matching prevLogIndex and prevLogIndex
 	Success bool
+	// the next index matched to leader
+	NextIndex int
 }
 
 // AppendEntries ...
@@ -424,8 +490,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	reply.Success = false
 	if args.Term < rf.currentTerm {
-		goto RET_FALSE
+		reply.NextIndex = rf.getLastLogIndex() + 1
+		reply.Term = rf.currentTerm
+		return
 	}
 
 	rf.chanHeartbeat <- true
@@ -437,17 +506,49 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Term = args.Term
 
-	if args.PrevLogIndex < len(rf.log) && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		goto RET_FALSE
+	// if args.PrevLogIndex < len(rf.log) && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	// 	goto RET_FALSE
+	// }
+
+	if args.PrevLogIndex > rf.getLastLogIndex() {
+		reply.NextIndex = rf.getLastLogIndex() + 1
+		return
 	}
 
-	if 0 == len(args.Entries) {
-		// heartbeat, reset timeout
+	baseIndex := rf.log[0].Index
+	if args.PrevLogIndex > baseIndex {
+		term := rf.log[args.PrevLogIndex-baseIndex].Term
+		if args.PrevLogTerm != term {
+			// 日志不匹配, 然后从上一个日志处开始找, 直到第一个不是 PrevLogTerm 任期的日志
+			// 优化减少被拒绝的附加日志的 RPCs 次数, 帮助 Leader 减少 nextIndex 越过所有那个任期冲突的所有日志条目, 即每个任期附加一次 RPC 而不是每个日志
+			for i := args.PrevLogIndex - 1; i >= baseIndex; i-- {
+				if rf.log[i-baseIndex].Term != term {
+					reply.NextIndex = i + 1
+					break
+				}
+			}
+			return
+		}
 	}
 
-RET_FALSE:
-	reply.Term = rf.currentTerm
-	reply.Success = false
+	if args.PrevLogIndex >= baseIndex {
+		// 丢弃所有的与 Leader 冲突的日志, 并附加新的日志
+		rf.log = rf.log[:args.PrevLogIndex+1-baseIndex]
+		rf.log = append(rf.log, args.Entries...)
+		reply.Success = true
+		reply.NextIndex = rf.getLastLogIndex() + 1
+	}
+
+	if args.LeaderCommit > rf.commitIndex {
+		// 提交日志
+		last := rf.getLastLogIndex()
+		if args.LeaderCommit > last {
+			rf.commitIndex = last
+		} else {
+			rf.commitIndex = args.LeaderCommit
+		}
+		rf.chanCommit <- true
+	}
 	return
 }
 
@@ -466,10 +567,20 @@ RET_FALSE:
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
-	term := -1
-	isLeader := true
 
 	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	term := rf.currentTerm
+	isLeader := rf.role == LEADER
+
+	if isLeader {
+		index = rf.getLastLogIndex() + 1
+		rf.log = append(rf.log, LogEntry{Term: term,
+			Command: command,
+			Index:   index})
+	}
 
 	return index, term, isLeader
 }
@@ -516,6 +627,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.chanHeartbeat = make(chan bool, 100)
 	rf.chanGrantVote = make(chan bool, 100)
 	rf.chanLeader = make(chan bool, 100)
+	rf.chanApply = applyCh
+	rf.chanCommit = make(chan bool, 100)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -535,7 +648,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					rf.role = CANDICATE
 				}
 			case LEADER:
-				rf.broadcastHeartbeat()
+				rf.broadcastAppendEntries()
 				time.Sleep(HBINTERVAL)
 			case CANDICATE:
 				rf.mu.Lock()
@@ -562,6 +675,24 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					}
 					rf.mu.Unlock()
 				}
+			}
+		}
+	}()
+
+	// 应用日志的协程
+	go func() {
+		for {
+			select {
+			case <-rf.chanCommit:
+				rf.mu.Lock()
+				commitIndex := rf.commitIndex
+				baseIndex := rf.log[0].Index
+				for i := rf.lastApplied + 1; i <= commitIndex; i++ {
+					msg := ApplyMsg{Index: i, Command: rf.log[i-baseIndex].Command}
+					applyCh <- msg
+					rf.lastApplied = i
+				}
+				rf.mu.Unlock()
 			}
 		}
 	}()
